@@ -443,27 +443,15 @@ class MultiHeadAttention(nn.Module):
 
         if USE_TRITON:
             
+            head_dim = queries.shape[-1]
             ori_dtype = queries.dtype
 
-            q_ht = hadamard_transform_ref(queries)
-            k_ht = hadamard_transform_ref(keys_e)
-
-            out_ref = torch.matmul(queries, keys_e.transpose(2, 3))
-            out_ht = torch.matmul(q_ht, k_ht.transpose(2, 3))
-
-            matched = torch.allclose(out_ref, out_ht, atol=1e-3)
-
-            breakpoint()
-
-            # v_ht = hadamard_transform_ref(values_e)
+            q_ht = hadamard_transform_ref(queries, scale=1.0 / (head_dim ** 0.5))
+            k_ht = hadamard_transform_ref(keys_e, scale=1.0 / (head_dim ** 0.5))
             
             q_fp8, scale_q = triton_quantize_fp8_row(q_ht)
             k_fp8, scale_k = triton_quantize_fp8_row(k_ht)
             v_fp8, scale_v = triton_quantize_fp8_row(values_e)
-
-            # y_fused_dequant = y_fused_quant.to(torch.float32) * y_fused_scale[:, None]
-            # y_fused_dequant = y_fused_dequant.to(torch.bfloat16)
-            # breakpoint()
 
             q_dequant =  (q_fp8.to(torch.float32) * scale_q.unsqueeze(-1)).to(ori_dtype)
             k_dequant =  (k_fp8.to(torch.float32) * scale_k.unsqueeze(-1)).to(ori_dtype)
