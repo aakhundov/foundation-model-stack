@@ -1,11 +1,9 @@
 import abc
+import functools
 from typing import Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.distributed
-from torch import Tensor, nn
-from torch.distributed.distributed_c10d import ProcessGroup
-from torch.nn import functional as F
 
 from fms import distributed
 from fms.distributed.tensorparallel import (
@@ -14,12 +12,18 @@ from fms.distributed.tensorparallel import (
 )
 from fms.modules.positions import PositionEncoder
 from fms.modules.tp import TPModule
-from fms.triton.triton_linear import TritonLinear
+from fms.triton.quantization import triton_quantize_fp8_row
+from fms.triton.hadmard_transform import hadamard_transform_ref
 from fms.triton.triton_flash_attention import flash as flash_amd_triton_kernel
-import functools
+from fms.triton.triton_linear import TritonLinear
+from torch import nn, Tensor
+from torch.distributed.distributed_c10d import ProcessGroup
+from torch.nn import functional as F
 
 USE_CUDA = False
 USE_TRITON = True
+USE_FP8_ATTENTION = True
+
 
 # flex_attention = torch.compile(flex_attention, dynamic=False)
 class QKV(nn.Module, metaclass=abc.ABCMeta):
@@ -174,15 +178,13 @@ class FusedQKV(QKV):
                 sum(self.splits),
                 bias=self.use_bias,
             )
-        
+
         if USE_TRITON:
             self.qkv_fused = TritonLinear(
                 self.emb_dim,
                 sum(self.splits),
                 bias=self.use_bias,
             )
-
-
 
     def unfuse_weights(self):
         result = UnfusedQKV(
@@ -224,9 +226,11 @@ class FusedQKV(QKV):
 def causal_mask_prefill(b, h, q_idx, kv_idx):
     return q_idx >= kv_idx
 
+
 def causal_mask_decode(self, b, h, q_idx, kv_idx):
     offset = self.kv_len - self.q_len
     return offset + q_idx >= kv_idx
+
 
 class MultiHeadAttention(nn.Module):
     """
@@ -280,17 +284,17 @@ class MultiHeadAttention(nn.Module):
             self.emb_v_per_head,
             self.use_bias,
         )
-    
+
         if USE_CUDA:
             self.dense = nn.Linear(
                 self.nheads * self.emb_v_per_head, self.emb_dim, bias=use_bias
             )
-            
+
         if USE_TRITON:
             self.dense = TritonLinear(
                 self.nheads * self.emb_v_per_head, self.emb_dim, bias=use_bias
             )
-        
+
         if self.p_dropout:
             self.attn_dropout = nn.Dropout(self.p_dropout)
         self.position_encoder = position_encoder
@@ -312,7 +316,6 @@ class MultiHeadAttention(nn.Module):
 
     def to_tp(self, group: ProcessGroup) -> "TPMultiHeadAttention":
         return TPMultiHeadAttention.import_module(self, group)
-    
 
     def forward(
         self,
@@ -348,7 +351,6 @@ class MultiHeadAttention(nn.Module):
         # q, k, v: batch_size x seq_len x emb_dim
         # mask: batch_size x seq_len x seq_len
         batch_size, q_len, _ = q.size()
-
 
         # if this is self attention, we always recompute
         # cross attention only gets computed when a cache does not exist
@@ -441,7 +443,33 @@ class MultiHeadAttention(nn.Module):
 
         if USE_TRITON:
             
-            attn = flash_amd_triton_kernel(queries, keys_e, values_e)
+            ori_dtype = queries.dtype
+
+            q_ht = hadamard_transform_ref(queries)
+            k_ht = hadamard_transform_ref(keys_e)
+
+            out_ref = torch.matmul(queries, keys_e.transpose(2, 3))
+            out_ht = torch.matmul(q_ht, k_ht.transpose(2, 3))
+
+            matched = torch.allclose(out_ref, out_ht, atol=1e-3)
+
+            breakpoint()
+
+            # v_ht = hadamard_transform_ref(values_e)
+            
+            q_fp8, scale_q = triton_quantize_fp8_row(q_ht)
+            k_fp8, scale_k = triton_quantize_fp8_row(k_ht)
+            v_fp8, scale_v = triton_quantize_fp8_row(values_e)
+
+            # y_fused_dequant = y_fused_quant.to(torch.float32) * y_fused_scale[:, None]
+            # y_fused_dequant = y_fused_dequant.to(torch.bfloat16)
+            # breakpoint()
+
+            q_dequant =  (q_fp8.to(torch.float32) * scale_q.unsqueeze(-1)).to(ori_dtype)
+            k_dequant =  (k_fp8.to(torch.float32) * scale_k.unsqueeze(-1)).to(ori_dtype)
+            v_dequant =  (v_fp8.to(torch.float32) * scale_v.unsqueeze(-1)).to(ori_dtype)
+
+            attn = flash_amd_triton_kernel(q_dequant, k_dequant, v_dequant)
 
         if attn_algorithm:
             torch.backends.cuda.enable_flash_sdp(self.previous_flash)
