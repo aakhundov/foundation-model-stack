@@ -453,11 +453,14 @@ class MultiHeadAttention(nn.Module):
             k_fp8, scale_k = triton_quantize_fp8_row(k_ht)
             v_fp8, scale_v = triton_quantize_fp8_row(values_e)
 
-            q_dequant =  (q_fp8.to(torch.float32) * scale_q.unsqueeze(-1)).to(ori_dtype)
-            k_dequant =  (k_fp8.to(torch.float32) * scale_k.unsqueeze(-1)).to(ori_dtype)
-            v_dequant =  (v_fp8.to(torch.float32) * scale_v.unsqueeze(-1)).to(ori_dtype)
+            # q_dequant =  (q_fp8.to(torch.float32) * scale_q.unsqueeze(-1)).to(ori_dtype)
+            # k_dequant =  (k_fp8.to(torch.float32) * scale_k.unsqueeze(-1)).to(ori_dtype)
+            # v_dequant =  (v_fp8.to(torch.float32) * scale_v.unsqueeze(-1)).to(ori_dtype)
 
-            attn = flash_amd_triton_kernel(q_dequant, k_dequant, v_dequant)
+            # scale_q = torch.ones_like(scale_q)
+            # scale_k = torch.ones_like(scale_k)
+
+            attn = flash_amd_triton_kernel(q_fp8, k_fp8, values_e, scale_q, scale_k, scale_v)
 
         if attn_algorithm:
             torch.backends.cuda.enable_flash_sdp(self.previous_flash)

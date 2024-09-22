@@ -155,9 +155,17 @@ def load_fn(block_ptr, first, second, pad):
     return tensor
 
 @triton.jit
+def load_scale_fn(block_ptr, first, pad):
+    if first:
+        tensor = tl.load(block_ptr, boundary_check=(0,), padding_option=pad)
+    else:
+        tensor = tl.load(block_ptr)
+    return tensor
+
+@triton.jit
 def _attn_fwd_inner(
-    acc, l_i, m_i, q,
-    K_block_ptr, V_block_ptr,
+    acc, l_i, m_i, q, qs,
+    K_block_ptr, Ks_block_ptr, V_block_ptr,
     start_m,
     actual_seqlen_k,
     actual_seqlen_q,
@@ -188,6 +196,8 @@ def _attn_fwd_inner(
         # For padded blocks, we will overrun the tensor size if
         # we load all BLOCK_N. For others, the blocks are all within range.
         k = load_fn(K_block_ptr, PADDED_HEAD, MASK_STEPS and (n_extra_tokens != 0), "zero")
+        ks = load_scale_fn(Ks_block_ptr, MASK_STEPS and (n_extra_tokens != 0), "zero")
+        ks = tl.where(ks < 1e-6, 1.0, ks)
         if PRE_LOAD_V:
             v = load_fn(V_block_ptr, MASK_STEPS and (n_extra_tokens != 0), PADDED_HEAD, "zero")
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
@@ -211,6 +221,8 @@ def _attn_fwd_inner(
             qk = tl.where(causal_mask, qk, float("-inf"))
         # -- compute qk ----
         qk += tl.dot(q, k)
+        qk_scale = qs[:, None] * ks[None, :]
+        qk *= qk_scale
         if bias_ptr is not None:
             bias = load_fn(bias_ptr, False, MASK_STEPS and (n_extra_tokens != 0), "zero")
             # While bias is added after multiplying qk with sm_scale,
@@ -259,6 +271,7 @@ def _attn_fwd_inner(
         acc += tl.dot(p.to(V_block_ptr.type.element_ty), v)
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
+        Ks_block_ptr = tl.advance(Ks_block_ptr, (BLOCK_N,))
         if bias_ptr is not None:
             bias_ptr = tl.advance(bias_ptr, (0, BLOCK_N))
         if RETURN_ENCODED_SOFTMAX:
@@ -268,10 +281,13 @@ def _attn_fwd_inner(
 
 @triton.jit
 def attn_fwd(
-    Q, K, V, bias, sm_scale, L, Out,
+    Q, K, V, Qs, Ks, Vs, bias, sm_scale, L, Out,
     stride_qz, stride_qh, stride_qm, stride_qk,
+    stride_qsz, stride_qsh, stride_qsm,
     stride_kz, stride_kh, stride_kn, stride_kk,
+    stride_ksz, stride_ksh, stride_ksn,
     stride_vz, stride_vh, stride_vk, stride_vn,
+    stride_vsz, stride_vsh, stride_vsk,
     stride_oz, stride_oh, stride_om, stride_on,
     stride_bz, stride_bh, stride_bm, stride_bn,
     stride_az, stride_ah,
@@ -378,6 +394,15 @@ def attn_fwd(
         block_shape=(BLOCK_M, BLOCK_DMODEL),
         order=(1, 0)
     )
+    qs_offset = off_z * stride_qsz +  off_h_q * stride_qsh + cu_seqlens_q_start * stride_qsm
+    Qs_block_ptr = tl.make_block_ptr(
+        base=Qs + qs_offset,
+        shape=(seqlen_q,),
+        strides=(stride_qsm,),
+        offsets=(start_m * BLOCK_M,),
+        block_shape=(BLOCK_M,),
+        order=(0,)
+    )
     k_offset = off_z * stride_kz + off_h_k * stride_kh + cu_seqlens_k_start * stride_kn
     K_block_ptr = tl.make_block_ptr(
         base=K + k_offset,
@@ -386,6 +411,15 @@ def attn_fwd(
         offsets=(0, 0),
         block_shape=(BLOCK_DMODEL, BLOCK_N),
         order=(0, 1)
+    )
+    ks_offset = off_z * stride_ksz +  off_h_k * stride_ksh + cu_seqlens_k_start * stride_ksn
+    Ks_block_ptr = tl.make_block_ptr(
+        base=Ks + ks_offset,
+        shape=(seqlen_k,),
+        strides=(stride_ksn,),
+        offsets=(0,),
+        block_shape=(BLOCK_N,),
+        order=(0,)
     )
     v_offset = off_z * stride_vz + off_h_k * stride_vh + cu_seqlens_k_start * stride_vk
     V_block_ptr = tl.make_block_ptr(
@@ -442,6 +476,8 @@ def attn_fwd(
     qk_scale = sm_scale * 1.44269504089
     # Q is loaded once at the beginning and shared by all N blocks.
     q = load_fn(Q_block_ptr, True, padded_head, "zero")
+    qs = load_scale_fn(Qs_block_ptr, True, "zero")
+    qs = tl.where(qs < 1e-6, 1.0, qs)
     q = (q * qk_scale).to(Q_block_ptr.type.element_ty)
 
     # Here we compute how many full and masked blocks we have.
@@ -465,7 +501,7 @@ def attn_fwd(
     if n_full_blocks > 0:
         block_max = (n_blocks - masked_blocks) * BLOCK_N
         acc, l_i, m_i = _attn_fwd_inner(
-            acc, l_i, m_i, q, K_block_ptr, V_block_ptr,
+            acc, l_i, m_i, q, qs, K_block_ptr, Ks_block_ptr, V_block_ptr,
             start_m, seqlen_k, seqlen_q,
             dropout_p, philox_seed, batch_philox_offset, encoded_softmax_block_ptr,
             # _, _, offs_n_causal, masked_blocks, n_extra_tokens, _
@@ -486,6 +522,7 @@ def attn_fwd(
         else:
             offs_n_causal = 0
         K_block_ptr = tl.advance(K_block_ptr, (0, n_full_blocks*BLOCK_N))
+        Ks_block_ptr = tl.advance(Ks_block_ptr, (n_full_blocks*BLOCK_N,))
         V_block_ptr = tl.advance(V_block_ptr, (n_full_blocks*BLOCK_N, 0))
         if bias_ptr is not None:
             bias_ptr = tl.advance(bias_ptr, (0, n_full_blocks*BLOCK_N))
@@ -493,7 +530,7 @@ def attn_fwd(
             encoded_softmax_block_ptr = tl.advance(encoded_softmax_block_ptr,
                                                    (0, n_full_blocks))
         acc, l_i, m_i = _attn_fwd_inner(
-            acc, l_i, m_i, q, K_block_ptr, V_block_ptr,
+            acc, l_i, m_i, q, qs, K_block_ptr, Ks_block_ptr, V_block_ptr,
             start_m, seqlen_k, seqlen_q,
             dropout_p, philox_seed, batch_philox_offset, encoded_softmax_block_ptr,
             block_min, block_max, offs_n_causal, masked_blocks, n_extra_tokens, bias_ptr, alibi_slope,
@@ -632,7 +669,14 @@ def attention(q, k, v, sm_scale):
 
 
 @torch.library.custom_op("triton::flash", mutates_args=())
-def flash(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+def flash(
+    q: torch.Tensor, 
+    k: torch.Tensor, 
+    v: torch.Tensor,
+    qs: torch.Tensor, 
+    ks: torch.Tensor, 
+    vs: torch.Tensor,
+) -> torch.Tensor:
 
     o = torch.empty_like(q, dtype=v.dtype)
     sm_scale = q.shape[-1] ** -0.5
@@ -643,8 +687,11 @@ def flash(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     max_seqlens_q = seqlen_q
 
     q_strides = (q.stride(0), q.stride(1), q.stride(2), q.stride(3))
+    qs_strides = (qs.stride(0), qs.stride(1), qs.stride(2))
     k_strides = (k.stride(0), k.stride(1), k.stride(2), k.stride(3))
+    ks_strides = (ks.stride(0), ks.stride(1), ks.stride(2))
     v_strides = (v.stride(0), v.stride(1), v.stride(2), v.stride(3))
+    vs_strides = (vs.stride(0), vs.stride(1), vs.stride(2))
     o_strides = (o.stride(0), o.stride(1), o.stride(2), o.stride(3))
 
     # Get closest power of 2 over or equal to 32.
@@ -680,10 +727,10 @@ def flash(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     
     bias_strides = (0,0,0,0)
     alibi_strides = (0, 0)
-    
+
     attn_fwd[grid](
-        q, k, v, None, sm_scale, M, o,
-        *q_strides, *k_strides, *v_strides, *o_strides, *bias_strides, *alibi_strides,
+        q, k, v, qs, ks, vs, None, sm_scale, M, o,
+        *q_strides, *qs_strides, *k_strides, *ks_strides, *v_strides, *vs_strides, *o_strides, *bias_strides, *alibi_strides,
         None, None,
         BLOCK_M=BLOCK_M,
         PRE_LOAD_V=PRE_LOAD_V,
