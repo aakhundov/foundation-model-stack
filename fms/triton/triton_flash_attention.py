@@ -165,7 +165,7 @@ def load_scale_fn(block_ptr, first, pad):
 @triton.jit
 def _attn_fwd_inner(
     acc, l_i, m_i, q, qs,
-    K_block_ptr, Ks_block_ptr, V_block_ptr,
+    K_block_ptr, Ks_block_ptr, V_block_ptr, Vs_block_ptr,
     start_m,
     actual_seqlen_k,
     actual_seqlen_q,
@@ -189,7 +189,8 @@ def _attn_fwd_inner(
     MASK_STEPS: tl.constexpr,
     ENABLE_DROPOUT: tl.constexpr,
     RETURN_ENCODED_SOFTMAX: tl.constexpr,
-    PADDED_HEAD: tl.constexpr
+    PADDED_HEAD: tl.constexpr,
+    MAX_FP8: tl.constexpr,
 ):
     # loop over k, v, and update accumulator
     for start_n in range (block_min, block_max, BLOCK_N):
@@ -200,6 +201,8 @@ def _attn_fwd_inner(
         ks = tl.where(ks < 1e-6, 1.0, ks)
         if PRE_LOAD_V:
             v = load_fn(V_block_ptr, MASK_STEPS and (n_extra_tokens != 0), PADDED_HEAD, "zero")
+            vs = load_scale_fn(Vs_block_ptr, MASK_STEPS and (n_extra_tokens != 0), "zero")
+            vs = tl.where(vs < 1e-6, 1.0, vs)
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         # We start from end of seqlen_k so only the first iteration would need
         # to be checked for padding if it is not a multiple of block_n
@@ -264,11 +267,18 @@ def _attn_fwd_inner(
         acc = acc * alpha[:, None]
         if not PRE_LOAD_V:
             v = load_fn(V_block_ptr, MASK_STEPS and (n_extra_tokens != 0), PADDED_HEAD, "zero")
+            vs = load_scale_fn(Vs_block_ptr, MASK_STEPS and (n_extra_tokens != 0), "zero")
+            vs = tl.where(vs < 1e-6, 1.0, vs)
         # -- update m_i and l_i
         l_i = l_i * alpha + l_ij
         # update m_i and l_i
         m_i = m_ij
+
+        ps = MAX_FP8 / tl.max(p, axis=1)
+        p /= ps[:, None]
         acc += tl.dot(p.to(V_block_ptr.type.element_ty), v)
+        acc *= ps[:, None] * vs[:, None]
+
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
         Ks_block_ptr = tl.advance(Ks_block_ptr, (BLOCK_N,))
@@ -306,6 +316,7 @@ def attn_fwd(
     RETURN_ENCODED_SOFTMAX: tl.constexpr,
     USE_ALIBI: tl.constexpr,
     BATCH_SIZE: tl.constexpr,
+    MAX_FP8: tl.constexpr,
 ):
     start_m = tl.program_id(0)
     off_h_q = tl.program_id(1)
@@ -421,6 +432,7 @@ def attn_fwd(
         block_shape=(BLOCK_N,),
         order=(0,)
     )
+    v_order: tl.constexpr = (0, 1) if V.dtype.element_ty == tl.float8e4nv else (1, 0)
     v_offset = off_z * stride_vz + off_h_k * stride_vh + cu_seqlens_k_start * stride_vk
     V_block_ptr = tl.make_block_ptr(
         base=V + v_offset,
@@ -428,7 +440,16 @@ def attn_fwd(
         strides=(stride_vk, stride_vn),
         offsets=(0, 0),
         block_shape=(BLOCK_N, BLOCK_DMODEL),
-        order=(1, 0)
+        order=v_order
+    )
+    vs_offset = off_z * stride_vsz + off_h_k * stride_vsh + cu_seqlens_k_start * stride_vsk
+    Vs_block_ptr = tl.make_block_ptr(
+        base=Vs + vs_offset,
+        shape=(seqlen_k,),
+        strides=(stride_vsk,),
+        offsets=(0,),
+        block_shape=(BLOCK_N,),
+        order=(0,)
     )
     if BIAS_TYPE != 0:
         b_offset = off_h_q * stride_bh # Note: this might get large enough to overflow on some configs
@@ -501,7 +522,7 @@ def attn_fwd(
     if n_full_blocks > 0:
         block_max = (n_blocks - masked_blocks) * BLOCK_N
         acc, l_i, m_i = _attn_fwd_inner(
-            acc, l_i, m_i, q, qs, K_block_ptr, Ks_block_ptr, V_block_ptr,
+            acc, l_i, m_i, q, qs, K_block_ptr, Ks_block_ptr, V_block_ptr, Vs_block_ptr,
             start_m, seqlen_k, seqlen_q,
             dropout_p, philox_seed, batch_philox_offset, encoded_softmax_block_ptr,
             # _, _, offs_n_causal, masked_blocks, n_extra_tokens, _
@@ -509,7 +530,7 @@ def attn_fwd(
             # IS_CAUSAL, ....
             False, BLOCK_M, BLOCK_DMODEL, BLOCK_N, offs_m, offs_n,
             # _, MASK_STEPS, ...
-            PRE_LOAD_V, False, ENABLE_DROPOUT, RETURN_ENCODED_SOFTMAX, padded_head
+            PRE_LOAD_V, False, ENABLE_DROPOUT, RETURN_ENCODED_SOFTMAX, padded_head, MAX_FP8,
         )
         block_min = block_max
         block_max = n_blocks * BLOCK_N
@@ -524,19 +545,20 @@ def attn_fwd(
         K_block_ptr = tl.advance(K_block_ptr, (0, n_full_blocks*BLOCK_N))
         Ks_block_ptr = tl.advance(Ks_block_ptr, (n_full_blocks*BLOCK_N,))
         V_block_ptr = tl.advance(V_block_ptr, (n_full_blocks*BLOCK_N, 0))
+        Vs_block_ptr = tl.advance(Vs_block_ptr, (n_full_blocks*BLOCK_N,))
         if bias_ptr is not None:
             bias_ptr = tl.advance(bias_ptr, (0, n_full_blocks*BLOCK_N))
         if RETURN_ENCODED_SOFTMAX:
             encoded_softmax_block_ptr = tl.advance(encoded_softmax_block_ptr,
                                                    (0, n_full_blocks))
         acc, l_i, m_i = _attn_fwd_inner(
-            acc, l_i, m_i, q, qs, K_block_ptr, Ks_block_ptr, V_block_ptr,
+            acc, l_i, m_i, q, qs, K_block_ptr, Ks_block_ptr, V_block_ptr, Vs_block_ptr,
             start_m, seqlen_k, seqlen_q,
             dropout_p, philox_seed, batch_philox_offset, encoded_softmax_block_ptr,
             block_min, block_max, offs_n_causal, masked_blocks, n_extra_tokens, bias_ptr, alibi_slope,
             IS_CAUSAL, BLOCK_M, BLOCK_DMODEL, BLOCK_N, offs_m, offs_n,
             # _, MASK_STEPS, ...
-            PRE_LOAD_V, True, ENABLE_DROPOUT, RETURN_ENCODED_SOFTMAX, padded_head
+            PRE_LOAD_V, True, ENABLE_DROPOUT, RETURN_ENCODED_SOFTMAX, padded_head, MAX_FP8,
         )
     # epilogue
     acc = acc / l_i[:, None]
@@ -678,8 +700,10 @@ def flash(
     vs: torch.Tensor,
 ) -> torch.Tensor:
 
-    o = torch.empty_like(q, dtype=v.dtype)
+    o = torch.empty_like(q, dtype=torch.float16)
     sm_scale = q.shape[-1] ** -0.5
+
+    max_fp8 = torch.finfo(q.dtype).max
 
     batch, nheads_q, seqlen_q, head_size = q.shape
     _, nheads_k, seqlen_k, _ = k.shape
@@ -752,6 +776,7 @@ def flash(
         ENABLE_DROPOUT=False,
         RETURN_ENCODED_SOFTMAX=False,
         BATCH_SIZE= q.shape[0],
+        MAX_FP8=max_fp8,
     )
     return o
 
